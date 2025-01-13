@@ -42,11 +42,12 @@
 
 use std::{
     borrow::Cow,
+    fmt::Debug,
     io::{Read, Seek, Write},
     num::NonZeroUsize,
     panic::{RefUnwindSafe, UnwindSafe},
     path::Path,
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Arc, Mutex},
 };
 
 use level::CompressionLevel;
@@ -223,10 +224,61 @@ impl<'a, 'd, 'p, 'r> ZipFileBuilder<'a, 'd, 'p, 'r> {
 ///   [`add_file_from_fs`](Self::add_file_from_fs)
 /// - `'r` is the lifetime of of borrowed data in readers supplied to
 ///   [`add_file_from_reader`](Self::add_file_from_reader)
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ZipArchive<'d, 'p, 'r> {
     jobs_queue: Vec<ZipJob<'d, 'p, 'r>>,
     data: ZipData,
+    progress_callback: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
+}
+
+/// Iterator that wraps a receiver and calls a progress callback for each item
+struct ProgressTracker<T> {
+    rx: mpsc::Receiver<T>,
+    current: usize,
+    total: usize,
+    progress_callback: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
+}
+
+impl<T> ProgressTracker<T> {
+    fn new(
+        rx: mpsc::Receiver<T>,
+        total: usize,
+        progress_callback: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
+    ) -> Self {
+        Self {
+            rx,
+            current: 0,
+            total,
+            progress_callback,
+        }
+    }
+}
+
+impl<T> Iterator for ProgressTracker<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.rx.recv().ok() {
+            Some(item) => {
+                self.current += 1;
+                if let Some(callback) = &self.progress_callback {
+                    callback(self.current, self.total);
+                }
+                Some(item)
+            }
+            None => None,
+        }
+    }
+}
+
+impl<'d, 'p, 'r> Debug for ZipArchive<'d, 'p, 'r> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZipArchive")
+            .field("jobs_queue", &self.jobs_queue)
+            .field("data", &self.data)
+            .field("progress_callback", &self.progress_callback.is_some())
+            .finish()
+    }
 }
 
 impl<'d, 'p, 'r> ZipArchive<'d, 'p, 'r> {
@@ -236,6 +288,12 @@ impl<'d, 'p, 'r> ZipArchive<'d, 'p, 'r> {
 
     fn push_file(&mut self, file: ZipFile) {
         self.data.files.push(file);
+    }
+
+    /// Set a progress callback. The callback will be called with the current progress and the total
+    /// amount of files to compress.
+    pub fn set_progress_callback(&mut self, callback: Box<dyn Fn(usize, usize) + Send + Sync>) {
+        self.progress_callback = Some(Arc::new(callback));
     }
 
     /// Create an empty [`ZipArchive`]
@@ -408,10 +466,12 @@ impl<'d, 'p, 'r> ZipArchive<'d, 'p, 'r> {
     /// zip data as soon as it's available - [`Self::write_with_threads`]
     fn compress_with_consumer<F, T>(&mut self, threads: usize, consumer: F) -> T
     where
-        F: FnOnce(&mut ZipData, mpsc::Receiver<ZipFile>) -> T,
+        F: FnOnce(&mut ZipData, ProgressTracker<ZipFile>) -> T,
     {
+        let total = self.jobs_queue.len();
         let jobs_drain = Mutex::new(self.jobs_queue.drain(..));
         let jobs_drain_ref = &jobs_drain;
+        let progress_callback = self.progress_callback.clone();
         std::thread::scope(|s| {
             let rx = {
                 let (tx, rx) = mpsc::channel();
@@ -426,7 +486,8 @@ impl<'d, 'p, 'r> ZipArchive<'d, 'p, 'r> {
                         }
                     });
                 }
-                rx
+                let tracker = ProgressTracker::new(rx, total, progress_callback);
+                tracker
             };
             consumer(&mut self.data, rx)
         })
